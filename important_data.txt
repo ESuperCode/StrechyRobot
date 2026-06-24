@@ -1,0 +1,4 @@
+hostname for raspberrypi: RaspberryPICam
+username for raspberrypi: bshanbhag
+password for raspberrypi: normal password
+camera ip address: 192.168.5.43
