@@ -4,36 +4,99 @@
 Adafruit_PWMServoDriver pwm40 = Adafruit_PWMServoDriver(0x40);
 Adafruit_PWMServoDriver pwm41 = Adafruit_PWMServoDriver(0x41);
 
-#define USMIN  600   
-#define USMAX  2400  
-#define SERVO_FREQ 50 
+#define USMIN 600
+#define USMAX 2400
+#define SERVO_FREQ 50
 
-// SPEED CONTROL: Lower this number to make the wave travel faster (in milliseconds)
-const int waveSpeedDelay = 300; 
+float servoValues[25];
 
-// Using the exact pin numbers from your image drawing
-int board41_pins[5][3] = {
-  {1, 6, 11}, // Column 0
-  {2, 7, 12}, // Column 1
-  {3, 8, 13}, // Column 2
-  {4, 9, 14}, // Column 3
-  {5, 10, 15} // Column 4
+// Pi numbering -> actual board/channels
+struct ServoMap {
+  Adafruit_PWMServoDriver* board;
+  uint8_t channel;
 };
 
-int board40_pins[5][2] = {
-  {6, 11}, // Column 0
-  {7, 12}, // Column 1
-  {8, 13}, // Column 2
-  {9, 14}, // Column 3
-  {10, 15} // Column 4
+ServoMap servos[25] = {
+  {&pwm41, 1},   // 1
+  {&pwm41, 2},   // 2
+  {&pwm41, 3},   // 3
+  {&pwm41, 4},   // 4
+  {&pwm41, 5},   // 5
+
+  {&pwm41, 6},   // 6
+  {&pwm41, 7},   // 7
+  {&pwm41, 8},   // 8
+  {&pwm41, 9},   // 9
+  {&pwm41,10},   // 10
+
+  {&pwm41,11},   // 11
+  {&pwm41,12},   // 12
+  {&pwm41,13},   // 13
+  {&pwm41,14},   // 14
+  {&pwm41,15},   // 15
+
+  {&pwm40, 6},   // 16
+  {&pwm40, 7},   // 17
+  {&pwm40, 8},   // 18
+  {&pwm40, 9},   // 19
+  {&pwm40,10},   // 20
+
+  {&pwm40,11},   // 21
+  {&pwm40,12},   // 22
+  {&pwm40,13},   // 23
+  {&pwm40,14},   // 24
+  {&pwm40,15}    // 25
 };
 
-void setServoAngle(Adafruit_PWMServoDriver &driver, int channel, int angle) {
-  int pulse = map(angle, 0, 180, USMIN, USMAX);
+void setServoAngle(Adafruit_PWMServoDriver &driver, int channel, float angle) {
+  int pulse = map((int)angle, 0, 180, USMIN, USMAX);
   driver.writeMicroseconds(channel, pulse);
 }
 
+void updateServos(float values[]) {
+
+  for (int i = 0; i < 25; i++) {
+
+    // y = -90x + 180
+    float angle = (-90.0 * values[i]) + 180.0;
+
+    angle = constrain(angle, 90.0, 180.0);
+
+    setServoAngle(
+      *(servos[i].board),
+      servos[i].channel,
+      angle
+    );
+  }
+}
+
+bool parseLine(String line, float values[]) {
+
+  int start = 0;
+
+  for (int i = 0; i < 25; i++) {
+
+    int comma = line.indexOf(',', start);
+
+    if (comma == -1) {
+      if (i == 24) {
+        values[i] = line.substring(start).toFloat();
+        return true;
+      }
+      return false;
+    }
+
+    values[i] = line.substring(start, comma).toFloat();
+    start = comma + 1;
+  }
+
+  return false;
+}
+
 void setup() {
+
+  Serial.begin(115200);
+
   pwm40.begin();
   pwm40.setOscillatorFrequency(27000000);
   pwm40.setPWMFreq(SERVO_FREQ);
@@ -42,27 +105,36 @@ void setup() {
   pwm41.setOscillatorFrequency(27000000);
   pwm41.setPWMFreq(SERVO_FREQ);
 
-  // Force all 25 servos to start flat at 180 degrees
-  for (int col = 0; col < 5; col++) {
-    for (int r = 0; r < 3; r++) setServoAngle(pwm41, board41_pins[col][r], 180);
-    for (int r = 0; r < 2; r++) setServoAngle(pwm40, board40_pins[col][r], 180);
+  delay(100);
+
+  // Start flat
+  for (int i = 0; i < 25; i++) {
+    setServoAngle(
+      *(servos[i].board),
+      servos[i].channel,
+      180
+    );
   }
-  delay(1500); 
+
+  Serial.println("READY");
 }
 
 void loop() {
-  // Step across columns 0 to 4
-  for (int col = 0; col < 5; col++) {
-    
-    // 1. Instantly pull down the active column to 90 degrees
-    for (int r = 0; r < 3; r++) setServoAngle(pwm41, board41_pins[col][r], 90);
-    for (int r = 0; r < 2; r++) setServoAngle(pwm40, board40_pins[col][r], 90);
 
-    // 2. Pause briefly while it is down
-    delay(waveSpeedDelay);
+  if (Serial.available()) {
 
-    // 3. Drive this column straight back up to 180 degrees
-    for (int r = 0; r < 3; r++) setServoAngle(pwm41, board41_pins[col][r], 180);
-    for (int r = 0; r < 2; r++) setServoAngle(pwm40, board40_pins[col][r], 180);
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+
+    if (parseLine(line, servoValues)) {
+
+      updateServos(servoValues);
+
+      Serial.println("OK");
+    }
+    else {
+
+      Serial.println("ERROR");
+    }
   }
 }
