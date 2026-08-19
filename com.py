@@ -32,6 +32,9 @@ import cv2
 import numpy as np
 import mediapipe as mp
 
+import matplotlib.pyplot as plt
+import time
+import random
 # ==========================================================
 # PI CONNECTION
 # ==========================================================
@@ -54,6 +57,49 @@ client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
 
 send_lock = threading.Lock()  # protects sendall from both threads
 
+
+class LiveGrapher:
+    def __init__(self, title="Live Data Stream", xlabel="Time / Step", ylabel="Value"):
+        """Initializes the window and plot styles."""
+        # Turn on interactive mode so plt.show() doesn't block your code execution
+        plt.ion()
+        
+        # Setup figure and axis
+        self.fig, self.ax = plt.subplots()
+        self.x_data = []
+        self.y_data = []
+        
+        # Initialize an empty line plot ('o-' gives points connected by lines)
+        self.line, = self.ax.plot(self.x_data, self.y_data, 'b-o', markersize=4)
+        
+        # Aesthetic setup
+        self.ax.set_title(title)
+        self.ax.set_xlabel(xlabel)
+        self.ax.set_ylabel(ylabel)
+        self.ax.grid(True, linestyle='--', alpha=0.6)
+
+    def add_data_point(self, x, y):
+        """Call this function whenever your code generates a new value."""
+        # Append new data
+        self.x_data.append(x)
+        self.y_data.append(y)
+        
+        # Update the line object with the new datasets
+        self.line.set_xdata(self.x_data)
+        self.line.set_ydata(self.y_data)
+        
+        # Dynamically rescale the axis limits to fit the new data
+        self.ax.relim()
+        self.ax.autoscale_view()
+        
+        # Redraw the canvas and flush UI events so the window updates instantly
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+
+    def keep_open(self):
+        """Call this at the very end of your script so the graph window stays open."""
+        plt.ioff()
+        plt.show()
 
 def log(where, msg):
     """Print locally AND forward to the Pi, so both terminals agree on
@@ -178,7 +224,9 @@ threading.Thread(target=network_ingest_thread, daemon=True).start()
 
 smooth_x = None
 smooth_y = None
-
+#FPS plot
+graph = LiveGrapher(title="Sensor Readings over Time", xlabel="Seconds", ylabel="Temperature")
+current_time=10
 
 # ==========================================================
 # MAIN LOOP
@@ -251,11 +299,12 @@ try:
                 traceback.print_exc()
 
         if time.time() - last_report > 10:
+            graph.add_data_point(current_time, frames_shown)
             print(f"[COMPUTER:main] {frames_shown} frames shown in last ~10s "
                   f"({frames_shown/10:.1f} fps).", flush=True)
             frames_shown = 0
             last_report = time.time()
-
+            current_time+=10
         if cv2.waitKey(1) & 0xFF == ord('q'):
             log("main", "User pressed 'q' — closing.")
             break
