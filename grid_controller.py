@@ -1,12 +1,11 @@
 """
 grid_controller.py — runs on the computer.
 
-Combines com.py's video pipeline with arduino_controller.py: instead of
-just tracking the palm position in raw pixel coordinates, this locates
-the 5x5 grid in the frame (via 4 black corner dots), builds a
-perspective-corrected mapping from pixels -> real-world centimeters,
-finds which grid block the hand is closest to, and (optionally) tells
-the Arduino to raise that block.
+Combines com.py's video pipeline with arduino_controller.py: draws a
+fixed-size grid rectangle centered on screen (no camera-based detection
+of any kind), finds which grid block the hand is closest to in plain
+pixel coordinates, and (optionally) tells the Arduino to raise that
+block.
 
 WIRE PROTOCOL for the video stream (must match picam.py exactly):
     1 byte  : message type  -> b'F' = frame payload, b'L' = log text
@@ -20,23 +19,14 @@ instructions were not to touch that logic. Everything under the
 
 GRID GEOMETRY
 --------------
-You gave block size ~3cm x 3.1cm, spacing ~0.5cm, 5x5 grid. The exact
-total-grid numbers you gave (~19cm x 19.5cm) don't quite match
-5*3+4*0.5=17.0 / 5*3.1+4*0.5=17.5, so this file uses the block+spacing
-math (not the rough total) since you said the measurements are really
-just for the ratios. The 4 black dots are assumed to sit at the outer
-corners of the block+spacing area itself (no extra margin outside the
-first/last block). If you add a physical border/margin around the
-blocks before the dots, adjust GRID_W_CM/GRID_H_CM (or add MARGIN_CM
-below) to match.
-
-TUNING YOU WILL LIKELY NEED TO DO
------------------------------------
-- DOT_THRESH / DOT_MIN_AREA / DOT_MAX_AREA / DOT_MIN_CIRCULARITY: tuned
-  for your dot size/lighting by trial and error. Run with SHOW_DOT_MASK
-  = True to see exactly what the thresholding is picking up.
-- Flip ENABLE_ARDUINO to True once you're happy with the on-screen grid
-  and highlighted block.
+GRID_SIZE_PX is the one number to tune: it sets the on-screen pixel
+width of the grid, and everything else (cell sizes, spacing, overall
+height) scales from it automatically, preserving the real 3.0cm x
+3.1cm block / 0.5cm spacing proportions. The grid is always centered
+in the frame and always drawn as a perfect axis-aligned rectangle —
+there's no detection step, so camera angle/distance/lighting don't
+matter here (the physical camera position just needs to be roughly
+consistent with wherever you tune GRID_SIZE_PX to line up).
 """
 
 import socket
@@ -197,182 +187,74 @@ smooth_y = None
 # GRID TRACKING  (new)
 # ==========================================================
 
-# --- physical layout, in centimeters ---
+# --- physical layout, used only to keep the block/spacing proportions correct ---
 GRID_COLS = 5
 GRID_ROWS = 5
 BLOCK_W_CM = 3.0
 BLOCK_H_CM = 3.1
 SPACING_CM = 0.5
 
-GRID_W_CM = GRID_COLS * BLOCK_W_CM + (GRID_COLS - 1) * SPACING_CM  # 17.0
-GRID_H_CM = GRID_ROWS * BLOCK_H_CM + (GRID_ROWS - 1) * SPACING_CM  # 17.5
+BLOCK_GRID_W_CM = GRID_COLS * BLOCK_W_CM + (GRID_COLS - 1) * SPACING_CM  # 17.0
+BLOCK_GRID_H_CM = GRID_ROWS * BLOCK_H_CM + (GRID_ROWS - 1) * SPACING_CM  # 17.5
 
-# world-space (cm) corners/centers of every cell, row-major:
-# index 0 = top-left block, index 24 = bottom-right block, matching the
-# order arduino_controller.send_servo_values() expects.
+# ---------------------------------------------------------------
+# THE ONE TUNABLE: width (in pixels) of the on-screen grid. Height is
+# derived automatically from BLOCK_GRID_W_CM/H_CM so the 3.0x3.1cm
+# block proportions stay correct — just move this one number to make
+# the whole grid bigger/smaller.
+# ---------------------------------------------------------------
+GRID_SIZE_PX = 200
+
+_scale = GRID_SIZE_PX / BLOCK_GRID_W_CM  # px per cm
+GRID_W_PX = GRID_SIZE_PX
+GRID_H_PX = BLOCK_GRID_H_CM * _scale
+
+# centered in the frame
+_origin_x = (WIDTH - GRID_W_PX) / 2.0
+_origin_y = (HEIGHT - GRID_H_PX) / 2.0
+
+# pixel-space corners/center of every cell, row-major — index 0 =
+# top-left block, index 24 = bottom-right block, matching
+# arduino_controller.send_servo_values().
 CELLS = []
 for row in range(GRID_ROWS):
     for col in range(GRID_COLS):
-        x0 = col * (BLOCK_W_CM + SPACING_CM)
-        y0 = row * (BLOCK_H_CM + SPACING_CM)
-        x1 = x0 + BLOCK_W_CM
-        y1 = y0 + BLOCK_H_CM
+        x0 = _origin_x + col * (BLOCK_W_CM + SPACING_CM) * _scale
+        y0 = _origin_y + row * (BLOCK_H_CM + SPACING_CM) * _scale
+        x1 = x0 + BLOCK_W_CM * _scale
+        y1 = y0 + BLOCK_H_CM * _scale
         CELLS.append({
             "index": row * GRID_COLS + col,
             "row": row,
             "col": col,
-            "center_cm": (x0 + BLOCK_W_CM / 2.0, y0 + BLOCK_H_CM / 2.0),
-            "corners_cm": np.array(
+            "center_px": ((x0 + x1) / 2.0, (y0 + y1) / 2.0),
+            "corners_px": np.array(
                 [[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32
             ),
         })
 
-WORLD_CORNERS_CM = np.array(
-    [[0.0, 0.0], [GRID_W_CM, 0.0], [0.0, GRID_H_CM], [GRID_W_CM, GRID_H_CM]],
-    dtype=np.float32,
-)  # order: TL, TR, BL, BR
 
-# --- black-dot detection tuning ---
-DOT_THRESH = 50             # grayscale value below which a pixel counts as "black"
-DOT_MIN_AREA = 20           # px^2, at 320x240 — raise if picking up noise
-DOT_MAX_AREA = 800          # px^2 — lower if it's merging with dark blocks
-DOT_MIN_CIRCULARITY = 0.55  # 1.0 = perfect circle; dots are small so keep this loose
-SHOW_DOT_MASK = True       # set True to debug the threshold in its own window
-
-CORNER_SMOOTH_ALPHA = 0.3   # 0 = frozen, 1 = no smoothing (raw each frame)
-
-# How far outside the grid (as a fraction of grid size) the hand is
-# still allowed to "count" toward the nearest block. Sanity check so a
-# hand way off in a corner of the frame doesn't grab whatever block
-# happens to be nearest.
-OUT_OF_BOUNDS_MARGIN = 0.35
-
-smoothed_corners = None  # np.array shape (4,2), order TL,TR,BL,BR
-
-
-def find_corner_dots(frame_bgr):
-    """Looks for exactly 4 small dark, roughly-circular blobs in the
-    frame. Returns a (4,2) float32 array of their centroids (in no
-    particular order) or None if it didn't find exactly 4 good
-    candidates this frame."""
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, mask = cv2.threshold(blur, DOT_THRESH, 255, cv2.THRESH_BINARY_INV)
-
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    if SHOW_DOT_MASK:
-        cv2.imshow("dot mask (debug)", mask)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    candidates = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < DOT_MIN_AREA or area > DOT_MAX_AREA:
-            continue
-        perimeter = cv2.arcLength(c, True)
-        if perimeter <= 0:
-            continue
-        circularity = 4 * np.pi * area / (perimeter * perimeter)
-        if circularity < DOT_MIN_CIRCULARITY:
-            continue
-        m = cv2.moments(c)
-        if m["m00"] == 0:
-            continue
-        cx = m["m10"] / m["m00"]
-        cy = m["m01"] / m["m00"]
-        candidates.append((cx, cy))
-
-    if len(candidates) != 4:
-        return None
-
-    return np.array(candidates, dtype=np.float32)
-
-
-def order_corners(pts):
-    """Sorts 4 unordered points into TL, TR, BL, BR using the standard
-    sum/diff trick: TL has the smallest x+y, BR the largest x+y, TR the
-    largest x-y, BL the smallest x-y. Works fine for a grid that's
-    rotated/skewed a moderate amount, which is the point."""
-    s = pts.sum(axis=1)
-    d = pts[:, 0] - pts[:, 1]
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmax(d)]
-    bl = pts[np.argmin(d)]
-    return np.array([tl, tr, bl, br], dtype=np.float32)
-
-
-def update_grid_homography(frame_bgr):
-    """Detects the 4 corner dots (if visible this frame), smooths them
-    against the last known good corners, and returns (H_img2world,
-    H_world2img) built from the smoothed corners — or (None, None) if
-    the grid has never been located yet."""
-    global smoothed_corners
-
-    raw = find_corner_dots(frame_bgr)
-    if raw is not None:
-        ordered = order_corners(raw)
-        if smoothed_corners is None:
-            smoothed_corners = ordered
-        else:
-            smoothed_corners = (
-                CORNER_SMOOTH_ALPHA * ordered
-                + (1 - CORNER_SMOOTH_ALPHA) * smoothed_corners
-            )
-
-    if smoothed_corners is None:
-        return None, None
-
-    h_img2world = cv2.getPerspectiveTransform(smoothed_corners, WORLD_CORNERS_CM)
-    h_world2img = cv2.getPerspectiveTransform(WORLD_CORNERS_CM, smoothed_corners)
-    return h_img2world, h_world2img
-
-
-def image_point_to_world(pt_xy, h_img2world):
-    pts = np.array([[pt_xy]], dtype=np.float32)  # shape (1,1,2)
-    out = cv2.perspectiveTransform(pts, h_img2world)
-    return float(out[0, 0, 0]), float(out[0, 0, 1])
-
-
-def world_points_to_image(pts_xy, h_world2img):
-    pts = np.array([pts_xy], dtype=np.float32)  # shape (1,N,2)
-    out = cv2.perspectiveTransform(pts, h_world2img)
-    return out[0]  # shape (N,2)
-
-
-def nearest_cell(world_xy):
-    """Returns the CELLS entry closest to world_xy (in cm), or None if
-    world_xy is well outside the grid bounds (see OUT_OF_BOUNDS_MARGIN)."""
-    wx, wy = world_xy
-    margin_x = GRID_W_CM * OUT_OF_BOUNDS_MARGIN
-    margin_y = GRID_H_CM * OUT_OF_BOUNDS_MARGIN
-    if not (-margin_x <= wx <= GRID_W_CM + margin_x
-            and -margin_y <= wy <= GRID_H_CM + margin_y):
-        return None
-
+def nearest_cell(px_xy):
+    """Returns the CELLS entry closest to px_xy (in on-screen pixels)."""
+    px, py = px_xy
     best = None
     best_dist2 = None
     for cell in CELLS:
-        cx, cy = cell["center_cm"]
-        dist2 = (wx - cx) ** 2 + (wy - cy) ** 2
+        cx, cy = cell["center_px"]
+        dist2 = (px - cx) ** 2 + (py - cy) ** 2
         if best_dist2 is None or dist2 < best_dist2:
             best_dist2 = dist2
             best = cell
     return best
 
 
-def draw_grid_overlay(frame, h_world2img, active_cell):
+def draw_grid_overlay(frame, active_cell):
     """Draws every cell's outline, and fills the active cell (if any)
     with a translucent highlight."""
     overlay = frame.copy()
 
     for cell in CELLS:
-        img_pts = world_points_to_image(cell["corners_cm"], h_world2img)
-        img_pts_int = img_pts.astype(np.int32)
+        img_pts_int = cell["corners_px"].astype(np.int32)
 
         is_active = active_cell is not None and cell["index"] == active_cell["index"]
         color = (0, 255, 255) if is_active else (255, 180, 0)
@@ -384,11 +266,6 @@ def draw_grid_overlay(frame, h_world2img, active_cell):
                       thickness=2 if is_active else 1)
 
     cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, dst=frame)
-
-    # also mark the 4 detected corner dots for visual calibration feedback
-    if smoothed_corners is not None:
-        for pt in smoothed_corners:
-            cv2.circle(frame, (int(pt[0]), int(pt[1])), 5, (0, 0, 255), -1)
 
 
 # ==========================================================
@@ -506,19 +383,8 @@ try:
                     # ==================================================
                     # GRID TRACKING  (new)
                     # ==================================================
-                    h_img2world, h_world2img = update_grid_homography(frame)
-
-                    active_cell = None
-                    if h_img2world is not None and hand_present:
-                        world_xy = image_point_to_world((smooth_x, smooth_y), h_img2world)
-                        active_cell = nearest_cell(world_xy)
-
-                    if h_world2img is not None:
-                        draw_grid_overlay(frame, h_world2img, active_cell)
-                    else:
-                        cv2.putText(frame, "Grid not found - need all 4 corner dots visible",
-                                    (10, HEIGHT - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                    (0, 0, 255), 2)
+                    active_cell = nearest_cell((smooth_x, smooth_y)) if hand_present else None
+                    draw_grid_overlay(frame, active_cell)
 
                     if active_cell is not None:
                         cv2.putText(
