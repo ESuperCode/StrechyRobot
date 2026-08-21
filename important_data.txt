@@ -4,3 +4,10 @@ password for raspberrypi: normal password
 camera ip address: 192.168.5.43
 command to access camera: ssh bshanbhag@RaspberryPICam or ssh bshanbhag@192.168.5.43
 main communication code for rasp pi: picam.py
+current manual corners:
+MANUAL_CORNERS_PX = np.array([
+    [92.5, 16.0],  # top-left
+    [299.5, 21.0],  # top-right
+    [83.5, 227.5],  # bottom-left
+    [291.5, 238.5],  # bottom-right
+], dtype=np.float32)

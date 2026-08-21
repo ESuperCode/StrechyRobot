@@ -1,11 +1,17 @@
 """
 grid_controller.py — runs on the computer.
 
-Combines com.py's video pipeline with arduino_controller.py: draws a
-fixed-size grid rectangle centered on screen (no camera-based detection
-of any kind), finds which grid block the hand is closest to in plain
-pixel coordinates, and (optionally) tells the Arduino to raise that
-block.
+Combines com.py's video pipeline with arduino_controller.py: uses a
+one-time MANUAL calibration of the grid's 4 corners (no per-frame
+detection at all — no rim, no dots, no brightness thresholding),
+builds a perspective-corrected mapping from pixels -> real-world
+centimeters from those fixed corners, finds which grid block the hand
+is closest to, and (optionally) tells the Arduino to raise that block.
+
+HOW TO CALIBRATE: run calibrate_grid.py once (and again anytime the
+camera or grid physically moves), click the 4 corners of the block
+grid in the window it opens, and paste its printed output into
+MANUAL_CORNERS_PX below.
 
 WIRE PROTOCOL for the video stream (must match picam.py exactly):
     1 byte  : message type  -> b'F' = frame payload, b'L' = log text
@@ -19,14 +25,13 @@ instructions were not to touch that logic. Everything under the
 
 GRID GEOMETRY
 --------------
-GRID_SIZE_PX is the one number to tune: it sets the on-screen pixel
-width of the grid, and everything else (cell sizes, spacing, overall
-height) scales from it automatically, preserving the real 3.0cm x
-3.1cm block / 0.5cm spacing proportions. The grid is always centered
-in the frame and always drawn as a perfect axis-aligned rectangle —
-there's no detection step, so camera angle/distance/lighting don't
-matter here (the physical camera position just needs to be roughly
-consistent with wherever you tune GRID_SIZE_PX to line up).
+Block size ~3cm x 3.1cm, spacing ~0.5cm, 5x5 grid -> the block+spacing
+area works out to ~17.0cm x 17.5cm. MANUAL_CORNERS_PX maps directly
+onto that rectangle via cv2.getPerspectiveTransform, computed once at
+startup (not per frame), so this correctly handles camera angle/skew
+the same way the detection-based versions did — the only difference is
+where the 4 corners come from (a human click instead of computer
+vision).
 """
 
 import socket
@@ -197,51 +202,79 @@ SPACING_CM = 0.5
 BLOCK_GRID_W_CM = GRID_COLS * BLOCK_W_CM + (GRID_COLS - 1) * SPACING_CM  # 17.0
 BLOCK_GRID_H_CM = GRID_ROWS * BLOCK_H_CM + (GRID_ROWS - 1) * SPACING_CM  # 17.5
 
-# ---------------------------------------------------------------
-# THE ONE TUNABLE: width (in pixels) of the on-screen grid. Height is
-# derived automatically from BLOCK_GRID_W_CM/H_CM so the 3.0x3.1cm
-# block proportions stay correct — just move this one number to make
-# the whole grid bigger/smaller.
-# ---------------------------------------------------------------
-GRID_SIZE_PX = 200
-
-_scale = GRID_SIZE_PX / BLOCK_GRID_W_CM  # px per cm
-GRID_W_PX = GRID_SIZE_PX
-GRID_H_PX = BLOCK_GRID_H_CM * _scale
-
-# centered in the frame
-_origin_x = (WIDTH - GRID_W_PX) / 2.0
-_origin_y = (HEIGHT - GRID_H_PX) / 2.0
-
-# pixel-space corners/center of every cell, row-major — index 0 =
+# world-space (cm) corners/centers of every cell, row-major, measured
+# from the block cluster's own top-left corner (0,0) — index 0 =
 # top-left block, index 24 = bottom-right block, matching
 # arduino_controller.send_servo_values().
 CELLS = []
 for row in range(GRID_ROWS):
     for col in range(GRID_COLS):
-        x0 = _origin_x + col * (BLOCK_W_CM + SPACING_CM) * _scale
-        y0 = _origin_y + row * (BLOCK_H_CM + SPACING_CM) * _scale
-        x1 = x0 + BLOCK_W_CM * _scale
-        y1 = y0 + BLOCK_H_CM * _scale
+        x0 = col * (BLOCK_W_CM + SPACING_CM)
+        y0 = row * (BLOCK_H_CM + SPACING_CM)
+        x1 = x0 + BLOCK_W_CM
+        y1 = y0 + BLOCK_H_CM
         CELLS.append({
             "index": row * GRID_COLS + col,
             "row": row,
             "col": col,
-            "center_px": ((x0 + x1) / 2.0, (y0 + y1) / 2.0),
-            "corners_px": np.array(
+            "center_cm": (x0 + BLOCK_W_CM / 2.0, y0 + BLOCK_H_CM / 2.0),
+            "corners_cm": np.array(
                 [[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32
             ),
         })
 
+WORLD_CORNERS_CM = np.array(
+    [[0.0, 0.0], [BLOCK_GRID_W_CM, 0.0], [0.0, BLOCK_GRID_H_CM], [BLOCK_GRID_W_CM, BLOCK_GRID_H_CM]],
+    dtype=np.float32,
+)  # order: TL, TR, BL, BR — corners of the block cluster itself
 
-def nearest_cell(px_xy):
-    """Returns the CELLS entry closest to px_xy (in on-screen pixels)."""
-    px, py = px_xy
+# --- MANUAL CALIBRATION ---
+MANUAL_CORNERS_PX = np.array([
+    [92.5, 16.0],  # top-left
+    [299.5, 21.0],  # top-right
+    [83.5, 227.5],  # bottom-left
+    [291.5, 238.5],  # bottom-right
+], dtype=np.float32)
+
+# Homography is computed ONCE at startup from the fixed corners above
+# — no per-frame detection at all, so this is also cheap.
+h_img2world = cv2.getPerspectiveTransform(MANUAL_CORNERS_PX, WORLD_CORNERS_CM)
+h_world2img = cv2.getPerspectiveTransform(WORLD_CORNERS_CM, MANUAL_CORNERS_PX)
+
+# How far outside the grid (as a fraction of grid size) the hand is
+# still allowed to "count" toward the nearest block. Sanity check so a
+# hand way off in a corner of the frame doesn't grab whatever block
+# happens to be nearest.
+OUT_OF_BOUNDS_MARGIN = 0.35
+
+
+def image_point_to_world(pt_xy):
+    pts = np.array([[pt_xy]], dtype=np.float32)  # shape (1,1,2)
+    out = cv2.perspectiveTransform(pts, h_img2world)
+    return float(out[0, 0, 0]), float(out[0, 0, 1])
+
+
+def world_points_to_image(pts_xy):
+    pts = np.array([pts_xy], dtype=np.float32)  # shape (1,N,2)
+    out = cv2.perspectiveTransform(pts, h_world2img)
+    return out[0]  # shape (N,2)
+
+
+def nearest_cell(world_xy):
+    """Returns the CELLS entry closest to world_xy (in cm), or None if
+    world_xy is well outside the grid bounds (see OUT_OF_BOUNDS_MARGIN)."""
+    wx, wy = world_xy
+    margin_x = BLOCK_GRID_W_CM * OUT_OF_BOUNDS_MARGIN
+    margin_y = BLOCK_GRID_H_CM * OUT_OF_BOUNDS_MARGIN
+    if not (-margin_x <= wx <= BLOCK_GRID_W_CM + margin_x
+            and -margin_y <= wy <= BLOCK_GRID_H_CM + margin_y):
+        return None
+
     best = None
     best_dist2 = None
     for cell in CELLS:
-        cx, cy = cell["center_px"]
-        dist2 = (px - cx) ** 2 + (py - cy) ** 2
+        cx, cy = cell["center_cm"]
+        dist2 = (wx - cx) ** 2 + (wy - cy) ** 2
         if best_dist2 is None or dist2 < best_dist2:
             best_dist2 = dist2
             best = cell
@@ -254,7 +287,8 @@ def draw_grid_overlay(frame, active_cell):
     overlay = frame.copy()
 
     for cell in CELLS:
-        img_pts_int = cell["corners_px"].astype(np.int32)
+        img_pts = world_points_to_image(cell["corners_cm"])
+        img_pts_int = img_pts.astype(np.int32)
 
         is_active = active_cell is not None and cell["index"] == active_cell["index"]
         color = (0, 255, 255) if is_active else (255, 180, 0)
@@ -267,12 +301,16 @@ def draw_grid_overlay(frame, active_cell):
 
     cv2.addWeighted(overlay, 0.35, frame, 0.65, 0, dst=frame)
 
+    # also mark the 4 calibrated corners for visual reference
+    for pt in MANUAL_CORNERS_PX:
+        cv2.circle(frame, (int(pt[0]), int(pt[1])), 5, (0, 0, 255), -1)
+
 
 # ==========================================================
-# ARDUINO CONTROL  (new)
+# ARDUINO CONTROL
 # ==========================================================
 
-ENABLE_ARDUINO = False   # flip to True once the grid overlay looks right
+ENABLE_ARDUINO = True  # flip to True once the grid overlay looks right
 ARDUINO_PORT = None      # e.g. "COM6" — None auto-detects like testing.py
 ARDUINO_POLL_SEC = 0.05  # how often the send thread checks for a new target
 
@@ -346,6 +384,14 @@ try:
                     yuv = yuv.reshape((int(HEIGHT * 1.5), WIDTH))
                     frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
 
+                    # Camera is physically mounted upside down (top/bottom
+                    # swapped, left/right already correct) — flip 0 =
+                    # vertical-only flip, corrects that without touching
+                    # left/right. Done once here, before anything downstream
+                    # (hand detection, grid overlay) sees the frame, so
+                    # everything stays consistent.
+                    frame = cv2.flip(frame, 0)
+
                     # ==================================================
                     # HAND DETECTION  (unchanged from com.py)
                     # ==================================================
@@ -383,7 +429,11 @@ try:
                     # ==================================================
                     # GRID TRACKING  (new)
                     # ==================================================
-                    active_cell = nearest_cell((smooth_x, smooth_y)) if hand_present else None
+                    active_cell = None
+                    if hand_present:
+                        world_xy = image_point_to_world((smooth_x, smooth_y))
+                        active_cell = nearest_cell(world_xy)
+
                     draw_grid_overlay(frame, active_cell)
 
                     if active_cell is not None:
